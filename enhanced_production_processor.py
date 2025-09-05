@@ -1,8 +1,30 @@
 #!/usr/bin/env python3
 """
-Enhanced Production Boleto Processor
+Enhanced Production Boleto Processor v2.0.0
 Integrates the successful direct POST approach with production-ready automation
+
+Features:
+- Direct POST method for reliable PDF extraction from HS Consórcios system
+- Iframe-aware login handling
+- Frame-based search functionality  
+- Customer name-based file naming from Excel data
+- Batch processing with configurable delays
+- Comprehensive logging and JSON report generation
+- Fixed duplicate boleto downloads issue
+
+Version History:
+- v1.0.0: Initial implementation with basic functionality
+- v2.0.0: Fixed duplicate downloads, enhanced selectors, production-ready
+
+Author: Boleto Automation Team
+Created: 2025-09-05
+Last Updated: 2025-09-05
 """
+
+__version__ = "2.0.0"
+__author__ = "Boleto Automation Team"
+__email__ = "automation@company.com"
+__status__ = "Production"
 
 import asyncio
 import argparse
@@ -22,8 +44,25 @@ from playwright.async_api import async_playwright, Browser, Page, BrowserContext
 
 
 class EnhancedProductionProcessor:
+    """
+    Enhanced Production Boleto Processor - Main automation class.
+    
+    This class handles the complete workflow for downloading boleto PDFs:
+    1. Login to HS Consórcios system via iframe
+    2. Search for grupo/cota records in frames
+    3. Navigate to boleto generation pages
+    4. Populate boleto tables with due dates
+    5. Extract parameters from PGTO PARC links
+    6. Make direct POST requests to retrieve PDF blobs
+    7. Save PDFs with customer-based naming convention
+    """
+    
     def __init__(self, config_path: str = "config.yaml"):
-        """Initialize the enhanced production processor."""
+        """Initialize the enhanced production processor.
+        
+        Args:
+            config_path (str): Path to YAML configuration file
+        """
         self.config = self.load_config(config_path)
         self.setup_logging()
         self.setup_directories()
@@ -62,7 +101,21 @@ class EnhancedProductionProcessor:
             os.makedirs(directory, exist_ok=True)
     
     async def login(self, page: Page) -> bool:
-        """Login to the system."""
+        """Login to the HS Consórcios system using iframe-based authentication.
+        
+        The login form is embedded in an iframe, so we need to:
+        1. Navigate to the base URL
+        2. Wait for iframe to load
+        3. Access iframe content
+        4. Fill username and password fields
+        5. Submit login form
+        
+        Args:
+            page (Page): Playwright page instance
+            
+        Returns:
+            bool: True if login successful, False otherwise
+        """
         try:
             self.logger.info("Starting login process...")
             
@@ -183,7 +236,26 @@ class EnhancedProductionProcessor:
             return {'cpf_cnpj': 'UNKNOWN', 'contemplado_status': 'UNKNOWN'}
     
     async def download_boletos_enhanced(self, page: Page, grupo: str, cota: str, record_info: Dict, timing_config: Dict) -> List[str]:
-        """Enhanced boleto download using direct POST approach."""
+        """Enhanced boleto download using direct POST approach.
+        
+        This method implements the core boleto download logic:
+        1. Click '2ª Via Boleto' link to navigate to generation page
+        2. Populate boleto table by filling due date and clicking 'Salvar'
+        3. Find PGTO PARC links using specific CSS selector
+        4. Extract onClick parameters from each link
+        5. Make direct POST requests to Slip.asp endpoint
+        6. Save PDF blobs with customer-based filenames
+        
+        Args:
+            page (Page): Playwright page instance
+            grupo (str): Grupo number
+            cota (str): Cota number
+            record_info (Dict): Record information including name, CPF/CNPJ, status
+            timing_config (Dict): Timing configuration for delays
+            
+        Returns:
+            List[str]: List of downloaded file paths
+        """
         downloaded_files = []
         
         try:
@@ -272,6 +344,8 @@ class EnhancedProductionProcessor:
                 self.logger.warning("Could not find Salvar button")
             
             # Find PGTO PARC links after table population
+            # Fixed: Using single specific selector to prevent duplicate selections
+            # Previous comma-separated selector was matching same links twice
             pgto_parc_links = await page.query_selector_all("a[href*='javascript:'][onclick*='submitFunction']:has-text('PGTO PARC')")
             if not pgto_parc_links:
                 self.logger.warning("No PGTO PARC links found after table population")
@@ -342,7 +416,23 @@ class EnhancedProductionProcessor:
             return downloaded_files
     
     async def extract_and_fetch_boleto_direct(self, page: Page, link, boleto_num: int) -> bytes:
-        """Extract onClick parameters and make direct POST request to get PDF blob."""
+        """Extract onClick parameters and make direct POST request to get PDF blob.
+        
+        This method performs the critical PDF extraction:
+        1. Get onClick attribute from PGTO PARC link
+        2. Parse JavaScript submitFunction parameters
+        3. Build form data for POST request
+        4. Execute direct POST to Slip.asp with session cookies
+        5. Return PDF blob as bytes
+        
+        Args:
+            page (Page): Playwright page instance
+            link: HTML link element with onClick attribute
+            boleto_num (int): Boleto number for logging
+            
+        Returns:
+            bytes: PDF content as bytes, or None if failed
+        """
         try:
             self.logger.info(f"🔍 Extracting onClick parameters for boleto {boleto_num}")
             
