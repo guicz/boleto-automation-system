@@ -1,0 +1,17 @@
+
+# Popup Content Fixed Boleto Automation - Requirements
+# Core dependencies for enhanced popup handling
+
+playwright>=1.40.0
+pandas>=2.0.0
+PyYAML>=6.0
+openpyxl>=3.1.0
+aiofiles>=23.0.0
+
+# Optional but recommended for better performance
+lxml>=4.9.0
+xlsxwriter>=3.1.0
+
+# Development and debugging (optional)
+pytest>=7.0.0
+pytest-asyncio>=0.21.0

@@ -1,0 +1,39 @@
+# Configuration file for Boleto Automation System
+# Copy this file to config.yaml and fill in your actual credentials
+
+site:
+  base_url: "https://your-site-url.com"
+  search_url: "https://your-site-url.com/search"
+  
+login:
+  username: "your_username_here"
+  password: "your_password_here"
+
+selectors:
+  login:
+    iframe: "iframe"
+    username_field: "input[name='j_username']"
+    password_field: "input[name='j_password']"
+    login_button: "input[name='btnLogin']"
+  
+  search:
+    grupo_field: "input[name='Grupo']"
+    cota_field: "input[name='Cota']"
+    search_button: "input[name='Button']"
+  
+  boleto:
+    segunda_via_link: "a[href*='2Via']"
+    date_input: "input[type='text'][size='10']"
+    salvar_button: "input[value='Salvar']"
+    pgto_parc_link: "a[href*='PGTO PARC']"
+
+processing:
+  batch_size: 5
+  delay_between_records: 3
+  timeout_seconds: 30
+  max_retries: 3
+
+browser:
+  headless: false
+  slow_mo: 100
+  timeout: 30000
