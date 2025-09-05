@@ -272,7 +272,7 @@ class EnhancedProductionProcessor:
                 self.logger.warning("Could not find Salvar button")
             
             # Find PGTO PARC links after table population
-            pgto_parc_links = await page.query_selector_all("a[href*='javascript:'][onclick*='submitFunction'], a:has-text('PGTO PARC')")
+            pgto_parc_links = await page.query_selector_all("a[href*='javascript:'][onclick*='submitFunction']:has-text('PGTO PARC')")
             if not pgto_parc_links:
                 self.logger.warning("No PGTO PARC links found after table population")
                 # Save debug HTML
