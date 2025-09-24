@@ -40,7 +40,10 @@ def sanitize_sheet_name(name: str) -> str:
 
 def format_range(sheet: str, range_clause: str) -> str:
     escaped = sheet.replace("'", "''")
-    return f"'{escaped}'!{range_clause}"
+    needs_quotes = not re.fullmatch(r"[A-Za-z0-9_]+", sheet)
+    if needs_quotes:
+        return f"'{escaped}'!{range_clause}"
+    return f"{sheet}!{range_clause}"
 
 
 def parse_sheet_range(value: str) -> Tuple[str, str]:
