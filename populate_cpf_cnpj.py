@@ -31,12 +31,24 @@ def normalize_header(value: str) -> str:
     return re.sub(r"[^A-Z0-9]+", "_", (value or "").strip().upper())
 
 
+def sanitize_sheet_name(name: str) -> str:
+    name = name.strip()
+    if name.startswith("'") and name.endswith("'") and len(name) >= 2:
+        name = name[1:-1]
+    return name
+
+
+def format_range(sheet: str, range_clause: str) -> str:
+    escaped = sheet.replace("'", "''")
+    return f"'{escaped}'!{range_clause}"
+
+
 def parse_sheet_range(value: str) -> Tuple[str, str]:
     if "!" in value:
         sheet, rng = value.split("!", 1)
     else:
         sheet, rng = value, "A:Z"
-    return sheet, rng
+    return sanitize_sheet_name(sheet), rng
 
 
 class CPFPopulator:
@@ -64,7 +76,7 @@ class CPFPopulator:
         self.cpf_index: Optional[int] = None
 
     def _ensure_header(self) -> List[str]:
-        header_values = self.sheets.get_values(f"{self.sheet_name}!1:1")
+        header_values = self.sheets.get_values(format_range(self.sheet_name, "1:1"))
         if not header_values or not header_values[0]:
             raise RuntimeError(
                 f"Worksheet {self.sheet_name} appears to have an empty header row"
@@ -95,7 +107,7 @@ class CPFPopulator:
     def _load_rows(self, header_row: List[str]) -> List[List[str]]:
         column_count = len(header_row)
         end_column = column_index_to_letter(column_count)
-        data_range = f"{self.sheet_name}!A2:{end_column}"
+        data_range = format_range(self.sheet_name, f"A2:{end_column}")
         rows = self.sheets.get_values(data_range)
         return rows
 
@@ -216,7 +228,10 @@ class CPFPopulator:
             )
 
         target_column_letter = column_index_to_letter(self.cpf_index + 1)
-        target_range = f"{self.sheet_name}!{target_column_letter}2:{target_column_letter}{total_rows + 1}"
+        target_range = format_range(
+            self.sheet_name,
+            f"{target_column_letter}2:{target_column_letter}{total_rows + 1}",
+        )
         values_payload = [[value] for value in column_values]
         update_success = self.sheets.update_values(target_range, values_payload)
         if not update_success:
