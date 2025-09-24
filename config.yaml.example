@@ -53,12 +53,12 @@ data_source:
   csv:
     enabled: false
     path: "tabela.csv"
-    url: "https://drive.google.com/uc?id=..."
+    url: "https://drive.google.com/uc?id=1nV9LyW7YBMK_JZFeGCi_11QWMqHuugKQmakOlzVhoZQ&export=download"
     encoding: "utf-8"
     delimiter: ","
   google_sheets:
     enabled: false
-    spreadsheet_id: "your_spreadsheet_id"
+    spreadsheet_id: "1nV9LyW7YBMK_JZFeGCi_11QWMqHuugKQmakOlzVhoZQ"
     range: "Página1!A:D"
 
 notifications:
