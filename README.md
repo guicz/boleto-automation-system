@@ -135,6 +135,22 @@ Timing (usually not needed):
   --min-pdf-size BYTES        Minimum PDF size (default: 20000)
 ```
 
+### Populate CPF/CNPJ Cache
+Before large runs, you can pre-fill the Google Sheet with CPF/CNPJ for every grupo/cota. This lets the automation jump straight to the boleto screen without repeating the lookup each day.
+
+```bash
+python populate_cpf_cnpj.py \
+  --sheet-range "Página1!A:D" \
+  --header-title "CPF/CNPJ"
+```
+
+- Uses the same config/service account from `config.yaml`.
+- Adds the `CPF/CNPJ` header if it does not exist and fills the column.
+- Skips rows that already have a value; use `--force` to refresh everything.
+- Optional `--delay 0.5` to be gentle with the HS Consórcios portal.
+
+Once populated, the monthly update run only needs to process new contracts.
+
 ## 📊 Expected Performance
 
 ### Success Metrics

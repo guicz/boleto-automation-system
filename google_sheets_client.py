@@ -66,6 +66,53 @@ class GoogleSheetsClient:
             self.logger.error("Unexpected error fetching Google Sheets data: %s", error)
         return []
 
+    def get_values(self, sheet_range: str) -> List[List[str]]:
+        try:
+            service = self._get_service()
+            result = (
+                service.spreadsheets()
+                .values()
+                .get(spreadsheetId=self.spreadsheet_id, range=sheet_range)
+                .execute()
+            )
+            values = result.get("values", [])
+            return values
+        except HttpError as error:
+            self.logger.error("Google Sheets get_values error: %s", error)
+        except Exception as error:  # pragma: no cover - defensive
+            self.logger.error("Unexpected error getting Google Sheets values: %s", error)
+        return []
+
+    def update_values(self, sheet_range: str, values: List[List[str]]) -> bool:
+        try:
+            service = self._get_service()
+            body = {"values": values}
+            response = (
+                service.spreadsheets()
+                .values()
+                .update(
+                    spreadsheetId=self.spreadsheet_id,
+                    range=sheet_range,
+                    valueInputOption="RAW",
+                    body=body,
+                )
+                .execute()
+            )
+            updated_cells = response.get("updatedCells", 0)
+            if updated_cells:
+                self.logger.debug(
+                    "Updated %s cells in range %s",
+                    updated_cells,
+                    sheet_range,
+                )
+                return True
+            self.logger.warning("No cells were updated for range %s", sheet_range)
+        except HttpError as error:
+            self.logger.error("Google Sheets update error: %s", error)
+        except Exception as error:  # pragma: no cover - defensive
+            self.logger.error("Unexpected error updating Google Sheets: %s", error)
+        return False
+
     def append_row(self, sheet_range: str, values: List[str]) -> bool:
         try:
             service = self._get_service()
