@@ -28,12 +28,55 @@ selectors:
     pgto_parc_link: "a[href*='PGTO PARC']"
 
 processing:
-  batch_size: 5
+  batch_size: 100
   delay_between_records: 3
   timeout_seconds: 30
   max_retries: 3
+  skip_processed_records: true
+  processed_state_file: "logs/processed_records.json"
+  processed_retention_days: 365
 
 browser:
   headless: false
   slow_mo: 100
   timeout: 30000
+
+google_drive:
+  enabled: false
+  credentials_path: "service-account.json"
+  drive_id: "your_drive_folder_id_here"
+  delegated_subject: null
+  delegated_subject_env: "GOOGLE_DELEGATED_SUBJECT"
+  use_year_month_folders: true
+
+data_source:
+  csv:
+    enabled: false
+    path: "tabela.csv"
+    url: "https://drive.google.com/uc?id=..."
+    encoding: "utf-8"
+    delimiter: ","
+  google_sheets:
+    enabled: false
+    spreadsheet_id: "your_spreadsheet_id"
+    range: "Página1!A:D"
+
+notifications:
+  enabled: false
+  webhook_url: "https://n8n.example.com/webhook/boleto"
+  method: "POST"
+  headers:
+    Content-Type: "application/json"
+  message_template: "Olá {nome}, seu boleto do grupo {grupo} cota {cota} está disponível."
+
+google_sheets_logging:
+  enabled: false
+  spreadsheet_id: "your_dashboard_spreadsheet_id"
+  range: "Dashboard!A:K"
+
+file_server:
+  enabled: false
+  downloads_dir: "downloads"
+  base_url: "https://your-domain.com/files"
+  secret_key: "change-me"
+  expiry_minutes: 30

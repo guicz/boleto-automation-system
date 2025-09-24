@@ -12,6 +12,12 @@ aiofiles>=23.0.0
 lxml>=4.9.0
 xlsxwriter>=3.1.0
 
+# Google Drive integration
+google-api-python-client>=2.126.0
+google-auth>=2.23.0
+google-auth-httplib2>=0.2.0
+requests>=2.31.0
+
 # Development and debugging (optional)
 pytest>=7.0.0
 pytest-asyncio>=0.21.0

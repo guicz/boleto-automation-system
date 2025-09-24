@@ -28,7 +28,10 @@ __status__ = "Production"
 
 import asyncio
 import argparse
+import ast
+import io
 import json
+import math
 import logging
 import os
 import sys
@@ -39,8 +42,14 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 import yaml
 from playwright.async_api import async_playwright, Browser, Page, BrowserContext
+
+from google_drive_uploader import GoogleDriveUploader
+from google_sheets_client import GoogleSheetsClient
+from notifier import WebhookNotifier
+from file_link_service import FileLinkService
 
 
 class EnhancedProductionProcessor:
@@ -63,11 +72,26 @@ class EnhancedProductionProcessor:
         Args:
             config_path (str): Path to YAML configuration file
         """
-        self.config = self.load_config(config_path)
+        self.config_path = Path(config_path).expanduser()
+        if not self.config_path.is_absolute():
+            self.config_path = Path.cwd() / self.config_path
+
+        self.config = self.load_config(self.config_path)
         self.setup_logging()
         self.setup_directories()
-        
-    def load_config(self, config_path: str) -> Dict:
+        self.google_drive_uploader: Optional[GoogleDriveUploader] = None
+        self.google_sheets_client: Optional[GoogleSheetsClient] = None
+        self.google_sheets_logger: Optional[GoogleSheetsClient] = None
+        self.google_sheets_log_range: Optional[str] = None
+        self.file_link_service: Optional[FileLinkService] = None
+        self.notifier: Optional[WebhookNotifier] = None
+        self.setup_google_drive()
+        self.setup_google_sheets()
+        self.setup_google_sheets_logger()
+        self.setup_file_server()
+        self.setup_notifier()
+
+    def load_config(self, config_path: Path) -> Dict:
         """Load configuration from YAML file."""
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -99,6 +123,481 @@ class EnhancedProductionProcessor:
         directories = ['downloads', 'screenshots', 'reports', 'temp', 'logs']
         for directory in directories:
             os.makedirs(directory, exist_ok=True)
+
+    def setup_google_drive(self):
+        """Initialize Google Drive uploader if configuration is provided."""
+        drive_config = self.config.get('google_drive', {}) or {}
+
+        if not drive_config.get('enabled', False):
+            self.logger.info("Google Drive upload disabled via configuration")
+            return
+
+        credentials_path_cfg = drive_config.get('credentials_path')
+        drive_id = drive_config.get('drive_id')
+        use_year_month = drive_config.get('use_year_month_folders', True)
+
+        if not credentials_path_cfg or not drive_id:
+            self.logger.error("Incomplete Google Drive configuration; uploads disabled")
+            return
+
+        credentials_path = Path(credentials_path_cfg).expanduser()
+        if not credentials_path.is_absolute():
+            credentials_path = self.config_path.parent / credentials_path
+
+        delegated_subject = drive_config.get('delegated_subject') or None
+        delegated_subject_env = drive_config.get('delegated_subject_env')
+        if not delegated_subject and delegated_subject_env:
+            env_subject = os.getenv(delegated_subject_env)
+            if env_subject:
+                delegated_subject = env_subject
+                self.logger.info(
+                    "Using delegated subject from environment variable %s",
+                    delegated_subject_env,
+                )
+            else:
+                self.logger.warning(
+                    "Environment variable %s not set; continuing without delegated subject",
+                    delegated_subject_env,
+                )
+
+        self.google_drive_uploader = GoogleDriveUploader(
+            credentials_path=str(credentials_path),
+            drive_id=drive_id,
+            use_year_month_folders=use_year_month,
+            delegated_subject=delegated_subject,
+            base_path=self.config_path.parent,
+            logger=self.logger,
+        )
+
+        if not self.google_drive_uploader.enabled:
+            self.logger.warning("Google Drive uploader could not be initialized; continuing without uploads")
+        else:
+            self.logger.info(
+                "Google Drive uploads enabled (folder_id=%s, hierarchy=%s)",
+                drive_id,
+                "ano/mes" if use_year_month else "flat",
+            )
+
+    def setup_google_sheets(self):
+        data_source = self.config.get('data_source', {}) or {}
+        sheets_config = data_source.get('google_sheets', {}) or {}
+        if not sheets_config.get('enabled', False):
+            self.logger.info("Google Sheets ingestion disabled via configuration")
+            return
+
+        spreadsheet_id = sheets_config.get('spreadsheet_id')
+        sheet_range = sheets_config.get('range')
+        if not spreadsheet_id or not sheet_range:
+            self.logger.error("Google Sheets configuration incomplete; disabling Sheets ingestion")
+            return
+
+        credentials_path_cfg = self.config.get('google_drive', {}).get('credentials_path')
+        if not credentials_path_cfg:
+            self.logger.error("Google Sheets requires service account credentials; none configured")
+            return
+
+        credentials_path = Path(credentials_path_cfg).expanduser()
+        if not credentials_path.is_absolute():
+            credentials_path = self.config_path.parent / credentials_path
+
+        if not credentials_path.exists():
+            self.logger.error(
+                "Google Sheets credentials file not found: %s",
+                credentials_path,
+            )
+            return
+
+        self.google_sheets_client = GoogleSheetsClient(
+            credentials_path=credentials_path,
+            spreadsheet_id=spreadsheet_id,
+            logger=self.logger,
+        )
+        self.logger.info("Google Sheets ingestion enabled (spreadsheet=%s)", spreadsheet_id)
+
+    def setup_google_sheets_logger(self):
+        logging_config = self.config.get('google_sheets_logging', {}) or {}
+        if not logging_config.get('enabled', False):
+            return
+
+        spreadsheet_id = logging_config.get('spreadsheet_id')
+        log_range = logging_config.get('range')
+        if not spreadsheet_id or not log_range:
+            self.logger.error("Google Sheets logging configuration incomplete; disabling logging")
+            return
+
+        credentials_path_cfg = self.config.get('google_drive', {}).get('credentials_path')
+        if not credentials_path_cfg:
+            self.logger.error("Google Sheets logging requires service account credentials")
+            return
+
+        credentials_path = Path(credentials_path_cfg).expanduser()
+        if not credentials_path.is_absolute():
+            credentials_path = self.config_path.parent / credentials_path
+
+        if not credentials_path.exists():
+            self.logger.error(
+                "Google Sheets logging credentials file not found: %s",
+                credentials_path,
+            )
+            return
+
+        self.google_sheets_logger = GoogleSheetsClient(
+            credentials_path=credentials_path,
+            spreadsheet_id=spreadsheet_id,
+            logger=self.logger,
+            scopes=GoogleSheetsClient.READ_WRITE_SCOPES,
+        )
+        self.google_sheets_log_range = logging_config.get('range')
+        self.logger.info("Google Sheets logging enabled (spreadsheet=%s)", spreadsheet_id)
+
+    def setup_file_server(self):
+        file_config = self.config.get('file_server', {}) or {}
+        if not file_config.get('enabled', False):
+            return
+
+        base_url = file_config.get('base_url')
+        secret_key = file_config.get('secret_key')
+        downloads_dir_cfg = file_config.get('downloads_dir', 'downloads')
+        expiry_minutes = int(file_config.get('expiry_minutes', 30))
+
+        if not base_url or not secret_key:
+            self.logger.error("File server configuration incomplete; disabling signed links")
+            return
+
+        downloads_dir = Path(downloads_dir_cfg)
+        if not downloads_dir.is_absolute():
+            downloads_dir = self.config_path.parent / downloads_dir
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            self.file_link_service = FileLinkService(
+                downloads_dir=downloads_dir,
+                base_url=base_url,
+                secret_key=secret_key,
+                expiry_minutes=expiry_minutes,
+            )
+            self.logger.info(
+                "Signed file links enabled (base_url=%s, expiry=%s min)",
+                base_url,
+                expiry_minutes,
+            )
+        except Exception as error:
+            self.logger.error("Failed to initialize file link service: %s", error)
+            self.file_link_service = None
+
+    def setup_notifier(self):
+        notifications_config = self.config.get('notifications', {}) or {}
+        if not notifications_config.get('enabled', False):
+            self.logger.info("Notification webhook disabled via configuration")
+            return
+
+        webhook_url = notifications_config.get('webhook_url')
+        method = notifications_config.get('method', 'POST')
+        headers = notifications_config.get('headers')
+        template = notifications_config.get('message_template', '')
+
+        if not webhook_url or not template:
+            self.logger.error("Notification configuration incomplete; disabling notifier")
+            return
+
+        self.notifier = WebhookNotifier(
+            webhook_url=webhook_url,
+            method=method,
+            headers=headers,
+            message_template=template,
+            logger=self.logger,
+        )
+        self.logger.info("Notification webhook enabled (%s)", webhook_url)
+
+    def parse_submit_function_args(self, onclick_attr: Optional[str]) -> Optional[List[str]]:
+        if not onclick_attr:
+            return None
+
+        match = re.search(r"submitFunction\((.*)\)", onclick_attr, re.DOTALL)
+        if not match:
+            return None
+
+        args_str = match.group(1)
+        try:
+            parsed_args = ast.literal_eval(f"[{args_str}]")
+            return ["" if value is None else str(value) for value in parsed_args]
+        except (ValueError, SyntaxError):
+            return None
+
+    def get_reference_date_from_submit_args(self, submit_args: Optional[List[str]]) -> datetime:
+        if submit_args and len(submit_args) > 2:
+            due_date_str = submit_args[2]
+            try:
+                return datetime.strptime(due_date_str, "%d/%m/%Y")
+            except (TypeError, ValueError):
+                pass
+        return datetime.now()
+
+    async def _collect_boleto_form_values(self, page: Page) -> Dict[str, str]:
+        result = await page.evaluate(
+            """
+            () => {
+                const form = document.forms.form1;
+                if (!form) {
+                    return {};
+                }
+                const fields = {};
+                const fieldNames = [
+                    'venctoinput',
+                    'Data_Limite_Vencimento_Boleto',
+                    'FlagAlterarData',
+                    'codigo_origem_recurso',
+                ];
+                for (const name of fieldNames) {
+                    const field = form[name];
+                    fields[name] = field?.value ?? '';
+                }
+                return fields;
+            }
+            """
+        )
+        return result or {}
+
+    def format_whatsapp_number(self, raw_number: str) -> Optional[str]:
+        digits = re.sub(r'\D', '', raw_number or '')
+        if not digits:
+            return None
+
+        if digits.startswith('55') and len(digits) >= 12:
+            return digits
+
+        if len(digits) >= 12:
+            return digits
+
+        self.logger.warning("Invalid WhatsApp number detected: %s", raw_number)
+        return None
+
+    def sanitize_grupo(self, raw_value: str) -> str:
+        digits = re.sub(r'\D', '', raw_value or '')
+        return digits
+
+    def sanitize_cota(self, raw_value: str) -> str:
+        value = (raw_value or '').split('-')[0]
+        digits = re.sub(r'\D', '', value)
+        if not digits:
+            digits = re.sub(r'\D', '', raw_value or '')
+        return digits
+
+    def load_records(
+        self,
+        excel_file: str,
+        start_from: int,
+        max_records: Optional[int],
+    ) -> List[Dict]:
+        records: List[Dict] = []
+
+        data_source = self.config.get('data_source', {}) or {}
+        csv_config = data_source.get('csv', {}) or {}
+
+        if csv_config.get('enabled', False):
+            path = csv_config.get('path')
+            url = csv_config.get('url')
+            encoding = csv_config.get('encoding', 'utf-8')
+            delimiter = csv_config.get('delimiter', ',')
+
+            try:
+                if path:
+                    csv_path = Path(path)
+                    if not csv_path.is_absolute():
+                        csv_path = self.config_path.parent / csv_path
+                    df = pd.read_csv(csv_path, encoding=encoding, sep=delimiter)
+                    self.logger.info(f"📊 Loaded {len(df)} records from CSV {csv_path}")
+                elif url:
+                    response = requests.get(url, timeout=30)
+                    response.raise_for_status()
+                    df = pd.read_csv(io.StringIO(response.text), encoding=encoding, sep=delimiter)
+                    self.logger.info(f"📊 Loaded {len(df)} records from CSV URL")
+                else:
+                    df = None
+
+                if df is not None:
+                    records = df.to_dict('records')
+                    for record in records:
+                        record['grupo'] = self.sanitize_grupo(record.get('GRUPO') or record.get('grupo'))
+                        record['cota'] = self.sanitize_cota(record.get('COTA') or record.get('cota'))
+                        record['nome'] = str(record.get('NOME') or record.get('nome') or '').strip()
+                        raw_phone = (
+                            record.get('WHATS')
+                            or record.get('whats')
+                            or record.get('telefone')
+                            or record.get('TELEFONE')
+                            or ''
+                        )
+                        if isinstance(raw_phone, float):
+                            if math.isnan(raw_phone):
+                                whats = ''
+                            else:
+                                whats = str(int(raw_phone))
+                        else:
+                            whats = str(raw_phone).strip()
+                            if whats.endswith('.0'):
+                                whats = whats[:-2]
+                        record['whats_raw'] = whats
+                        record['whats_formatted'] = self.format_whatsapp_number(whats)
+                    self.logger.info("Using CSV data source (%d records)", len(records))
+            except Exception as error:
+                self.logger.error("Failed to load CSV data source: %s", error)
+
+        if not records and self.google_sheets_client:
+            sheets_config = data_source.get('google_sheets', {})
+            sheet_range = sheets_config.get('range', 'Página1!A:D')
+            sheet_rows = self.google_sheets_client.fetch_records(sheet_range)
+            for row in sheet_rows:
+                record = {
+                    'grupo': self.sanitize_grupo(row.get('GRUPO', '')),
+                    'cota': self.sanitize_cota(row.get('COTA', '')),
+                    'nome': str(row.get('NOME', '')).strip(),
+                    'whats_raw': str(
+                        row.get('WHATS')
+                        or row.get('telefone')
+                        or row.get('TELEFONE')
+                        or ''
+                    ).strip(),
+                }
+                record['whats_formatted'] = self.format_whatsapp_number(record['whats_raw'])
+                records.append(record)
+
+            if not records:
+                self.logger.warning("Google Sheets returned no usable records; falling back to Excel")
+            else:
+                self.logger.info("Using %d records from Google Sheets", len(records))
+
+        if not records:
+            df = pd.read_excel(excel_file)
+            self.logger.info(f"📊 Loaded {len(df)} records from {excel_file}")
+            if start_from > 0:
+                df = df.iloc[start_from:]
+            if max_records:
+                df = df.head(max_records)
+            records = df.to_dict('records')
+            for record in records:
+                record['grupo'] = self.sanitize_grupo(record.get('grupo') or record.get('GRUPO'))
+                record['cota'] = self.sanitize_cota(record.get('cota') or record.get('COTA'))
+                raw_phone = (
+                    record.get('whats')
+                    or record.get('WHATS')
+                    or record.get('telefone')
+                    or record.get('TELEFONE')
+                    or ''
+                )
+                if isinstance(raw_phone, float):
+                    if math.isnan(raw_phone):
+                        whats = ''
+                    else:
+                        whats = str(int(raw_phone))
+                else:
+                    whats = str(raw_phone).strip()
+                    if whats.endswith('.0'):
+                        whats = whats[:-2]
+                record['whats_raw'] = whats
+                record['whats_formatted'] = self.format_whatsapp_number(whats)
+
+        start_index = max(start_from - 1, 0)
+        if start_index:
+            records = records[start_index:]
+        if max_records:
+            records = records[:max_records]
+
+        return records
+
+    def handle_post_download(
+        self,
+        record_info: Dict,
+        pdf_path: Path,
+        grupo: str,
+        cota: str,
+        drive_file_id: Optional[str],
+    ) -> None:
+        phone = record_info.get('whats_formatted')
+        nome = record_info.get('nome', 'Cliente')
+
+        file_url: Optional[str] = None
+        if self.file_link_service:
+            try:
+                file_url = self.file_link_service.generate_signed_url(pdf_path)
+            except Exception as error:
+                self.logger.error("Failed to generate signed URL for %s: %s", pdf_path, error)
+
+        notification_success: Optional[bool] = None
+        if self.notifier:
+            if phone:
+                notification_success = self.notifier.send_notification(
+                    phone_number=phone,
+                    nome=nome,
+                    grupo=grupo,
+                    cota=cota,
+                    pdf_path=Path(pdf_path),
+                    file_url=file_url,
+                    drive_file_id=drive_file_id,
+                )
+
+                if notification_success:
+                    self.logger.info("📨 Notification sent to %s for %s/%s", phone, grupo, cota)
+                else:
+                    self.logger.warning("⚠️ Notification failed for %s/%s", grupo, cota)
+            else:
+                self.logger.warning(
+                    "Skipping notification for %s/%s due to missing or invalid WhatsApp number",
+                    grupo,
+                    cota,
+                )
+            if file_url is None:
+                self.logger.error("Signed link generation failed; notification may not reach the client")
+        elif file_url:
+            self.logger.debug("Notifier disabled; generated signed URL %s", file_url)
+        else:
+            self.logger.warning("Notifier disabled and no signed URL available for %s", pdf_path.name)
+
+        if self.google_sheets_logger:
+            self.log_processing_result(
+                grupo=grupo,
+                cota=cota,
+                nome=nome,
+                phone=phone or record_info.get('whats_raw'),
+                pdf_path=pdf_path,
+                drive_file_id=drive_file_id,
+                file_url=file_url,
+                notification_success=notification_success,
+            )
+
+    def log_processing_result(
+        self,
+        grupo: str,
+        cota: str,
+        nome: str,
+        phone: Optional[str],
+        pdf_path: Path,
+        drive_file_id: Optional[str],
+        file_url: Optional[str],
+        notification_success: Optional[bool],
+    ) -> None:
+        if not self.google_sheets_logger or not self.google_sheets_log_range:
+            return
+
+        timestamp = datetime.now().isoformat()
+        drive_status = "OK" if drive_file_id else "SKIPPED"
+        notification_status = (
+            "OK" if notification_success else "FAIL" if notification_success is False else "SKIPPED"
+        )
+        values = [
+            timestamp,
+            grupo,
+            cota,
+            nome,
+            phone or '',
+            str(pdf_path),
+            drive_file_id or '',
+            drive_status,
+            notification_status,
+            file_url or '',
+        ]
+
+        self.google_sheets_logger.append_row(self.google_sheets_log_range, values)
     
     async def login(self, page: Page) -> bool:
         """Login to the HS Consórcios system using iframe-based authentication.
@@ -372,14 +871,32 @@ class EnhancedProductionProcessor:
             for i, link in enumerate(links_to_process):
                 try:
                     self.logger.info(f"🚀 PROCESSING BOLETO {i+1}/{len(links_to_process)} - DIRECT POST METHOD")
-                    
+
+                    onclick_attr = await link.get_attribute('onclick')
+                    if not onclick_attr:
+                        self.logger.error("No onClick attribute found for PGTO PARC link")
+                        continue
+
+                    submit_args = self.parse_submit_function_args(onclick_attr)
+                    if not submit_args:
+                        self.logger.error("Unable to parse submitFunction arguments for boleto %s", i + 1)
+                        continue
+
+                    self.logger.info(f"📋 onClick: {onclick_attr}")
+
                     # Extract onClick parameters and make direct POST request
-                    pdf_data = await self.extract_and_fetch_boleto_direct(page, link, i+1)
-                    
+                    pdf_data = await self.extract_and_fetch_boleto_direct(
+                        page,
+                        link,
+                        i + 1,
+                        onclick_attr=onclick_attr,
+                        submit_args=submit_args,
+                    )
+
                     if not pdf_data:
                         self.logger.error(f"❌ FAILED TO GET PDF DATA for boleto {i+1}")
                         continue
-                    
+
                     self.logger.info(f"✅ PDF DATA RECEIVED: {len(pdf_data)} bytes")
                     
                     # Generate filename
@@ -397,15 +914,39 @@ class EnhancedProductionProcessor:
                     # Save PDF
                     with open(pdf_path, 'wb') as f:
                         f.write(pdf_data)
-                    
+
                     # Verify file was created and has content
+                    drive_file_id: Optional[str] = None
                     if os.path.exists(pdf_path) and os.path.getsize(pdf_path) > 10000:
                         downloaded_files.append(pdf_path)
                         file_size = os.path.getsize(pdf_path)
                         self.logger.info(f"✅ BOLETO {i+1} DOWNLOADED: {filename} ({file_size} bytes)")
+
+                        reference_date = self.get_reference_date_from_submit_args(submit_args)
+
+                        # Upload to Google Drive if enabled
+                        if self.google_drive_uploader and self.google_drive_uploader.enabled:
+                            drive_file_id = self.google_drive_uploader.upload_pdf(
+                                local_path=pdf_path,
+                                file_name=filename,
+                                reference_date=reference_date,
+                            )
+                            if drive_file_id:
+                                self.logger.info(
+                                    "📁 BOLETO %s uploaded to Google Drive (file_id=%s)",
+                                    filename,
+                                    drive_file_id,
+                                )
+                            else:
+                                self.logger.warning(
+                                    "⚠️ Google Drive upload failed for %s",
+                                    filename,
+                                )
+
+                        self.handle_post_download(record_info, Path(pdf_path), grupo, cota, drive_file_id)
                     else:
                         self.logger.error(f"❌ PDF file too small or missing: {filename}")
-                        
+
                 except Exception as save_error:
                     self.logger.error(f"❌ Failed to save PDF {i+1}: {save_error}")
                     
@@ -415,9 +956,16 @@ class EnhancedProductionProcessor:
             self.logger.error(f"❌ Download process failed: {e}")
             return downloaded_files
     
-    async def extract_and_fetch_boleto_direct(self, page: Page, link, boleto_num: int) -> bytes:
+    async def extract_and_fetch_boleto_direct(
+        self,
+        page: Page,
+        link,
+        boleto_num: int,
+        onclick_attr: Optional[str] = None,
+        submit_args: Optional[List[str]] = None,
+    ) -> Optional[bytes]:
         """Extract onClick parameters and make direct POST request to get PDF blob.
-        
+
         This method performs the critical PDF extraction:
         1. Get onClick attribute from PGTO PARC link
         2. Parse JavaScript submitFunction parameters
@@ -435,98 +983,79 @@ class EnhancedProductionProcessor:
         """
         try:
             self.logger.info(f"🔍 Extracting onClick parameters for boleto {boleto_num}")
-            
-            # Get the onClick attribute
-            onclick_attr = await link.get_attribute('onclick')
-            if not onclick_attr:
-                self.logger.error("No onClick attribute found")
+
+            if onclick_attr is None:
+                onclick_attr = await link.get_attribute('onclick')
+
+            if submit_args is None:
+                submit_args = self.parse_submit_function_args(onclick_attr)
+
+            if not onclick_attr or not submit_args:
+                self.logger.error("Unable to process boleto %s due to missing submitFunction data", boleto_num)
                 return None
-                
-            self.logger.info(f"📋 onClick: {onclick_attr}")
-            
-            # Execute JavaScript to extract parameters and make POST request
-            pdf_data = await page.evaluate(f"""
-                async () => {{
-                    try {{
-                        // Extract parameters from onClick attribute
-                        const onClickStr = `{onclick_attr}`;
-                        const match = onClickStr.match(/submitFunction\\(([\\s\\S]*)\\)/);
-                        if (!match) {{
-                            console.error("Could not parse onClick parameters");
-                            return null;
-                        }}
-                        
-                        // Parse arguments
-                        const argsStr = match[1].replace(/'/g, '"');
-                        const args = JSON.parse('[' + argsStr + ']');
-                        const [
-                            ca, na, v, d, cg, cc, cm, vt,
-                            desc_pagamento, debito_conta, msg_boleto,
-                            emite_mensagem_ident_cob, vSN_Emite_Boleto, vSN_Emite_Boleto_Pix
-                        ] = args;
-                        
-                        // Get form fields
-                        const form = document.forms.form1;
-                        const venctoinput = form?.venctoinput?.value || "";
-                        const Data_Limite_Vencimento_Boleto = form?.Data_Limite_Vencimento_Boleto?.value || "";
-                        const FlagAlterarData = form?.FlagAlterarData?.value || "N";
-                        const codigo_origem_recurso = form?.codigo_origem_recurso?.value || "0";
-                        
-                        // Build form data
-                        const formData = new URLSearchParams({{
-                            numero_aviso: na,
-                            vencto: v,
-                            venctoinput: venctoinput,
-                            valor_total: vt,
-                            descricao: d,
-                            codigo_grupo: cg,
-                            codigo_cota: cc,
-                            codigo_movimento: cm,
-                            codigo_agente: ca,
-                            desc_pagamento: desc_pagamento,
-                            msg_dbt_apenas_parc_antes_venc: msg_boleto,
-                            sn_emite_boleto_pix: vSN_Emite_Boleto_Pix,
-                            Data_Limite_Vencimento_Boleto: Data_Limite_Vencimento_Boleto,
-                            FlagAlterarData: FlagAlterarData,
-                            codigo_origem_recurso: codigo_origem_recurso
-                        }});
-                        
-                        // Make POST request
-                        const actionUrl = new URL("../Slip/Slip.asp", location.href).toString();
-                        console.log("Making POST request to:", actionUrl);
-                        
-                        const response = await fetch(actionUrl, {{
-                            method: "POST",
-                            credentials: "include",
-                            headers: {{ "Content-Type": "application/x-www-form-urlencoded" }},
-                            body: formData.toString()
-                        }});
-                        
-                        if (!response.ok) {{
-                            throw new Error("HTTP error: " + response.status);
-                        }}
-                        
-                        // Get response as array buffer
-                        const arrayBuffer = await response.arrayBuffer();
-                        return Array.from(new Uint8Array(arrayBuffer));
-                        
-                    }} catch (error) {{
-                        console.error("Error in JavaScript:", error);
-                        return null;
-                    }}
-                }}
-            """)
-            
-            if not pdf_data:
-                self.logger.error("Failed to get PDF data from JavaScript")
+
+            form_values = await self._collect_boleto_form_values(page)
+            action_url = await page.evaluate(
+                "() => new URL('../Slip/Slip.asp', window.location.href).toString()"
+            )
+
+            try:
+                (
+                    codigo_agente,
+                    numero_aviso,
+                    vencto,
+                    descricao,
+                    codigo_grupo,
+                    codigo_cota,
+                    codigo_movimento,
+                    valor_total,
+                    desc_pagamento,
+                    debito_conta,
+                    msg_boleto,
+                    emite_mensagem_ident_cob,
+                    vSN_Emite_Boleto,
+                    vSN_Emite_Boleto_Pix,
+                ) = submit_args[:14]
+            except ValueError:
+                self.logger.error("Unexpected submitFunction argument format for boleto %s", boleto_num)
                 return None
-                
-            # Convert array back to bytes
-            pdf_bytes = bytes(pdf_data)
+
+            payload = {
+                'numero_aviso': numero_aviso,
+                'vencto': vencto,
+                'venctoinput': form_values.get('venctoinput', ''),
+                'valor_total': valor_total,
+                'descricao': descricao,
+                'codigo_grupo': codigo_grupo,
+                'codigo_cota': codigo_cota,
+                'codigo_movimento': codigo_movimento,
+                'codigo_agente': codigo_agente,
+                'desc_pagamento': desc_pagamento,
+                'msg_dbt_apenas_parc_antes_venc': msg_boleto,
+                'sn_emite_boleto_pix': vSN_Emite_Boleto_Pix,
+                'Data_Limite_Vencimento_Boleto': form_values.get('Data_Limite_Vencimento_Boleto', ''),
+                'FlagAlterarData': form_values.get('FlagAlterarData', 'N'),
+                'codigo_origem_recurso': form_values.get('codigo_origem_recurso', '0'),
+            }
+
+            response = await page.context.request.post(
+                action_url,
+                form=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+            )
+
+            if not response.ok:
+                self.logger.error(
+                    "Slip POST request failed for boleto %s: HTTP %s",
+                    boleto_num,
+                    response.status,
+                )
+                return None
+
+            pdf_bytes = await response.body()
             self.logger.info(f"✅ Got PDF data: {len(pdf_bytes)} bytes")
-            
             return pdf_bytes
-            
+
         except Exception as e:
             self.logger.error(f"❌ Error in extract_and_fetch_boleto_direct: {e}")
             return None
@@ -540,14 +1069,18 @@ class EnhancedProductionProcessor:
         
         page = await context.new_page()
         
-        grupo = str(record['grupo'])
-        cota = str(record['cota'])
+        grupo = str(record.get('grupo', '')).strip()
+        cota = str(record.get('cota', '')).strip()
         nome = record.get('nome', 'UNKNOWN')
-        
+        whats_raw = record.get('whats_raw') or record.get('whats') or ''
+        whats_formatted = record.get('whats_formatted')
+
         result = {
             'grupo': grupo,
             'cota': cota,
             'nome': nome,
+            'whats_raw': whats_raw,
+            'whats_formatted': whats_formatted,
             'status': 'failed',
             'downloaded_files': [],
             'timestamp': datetime.now().isoformat()
@@ -573,7 +1106,9 @@ class EnhancedProductionProcessor:
             
             # Add nome to record_info for filename generation
             record_info['nome'] = nome
-            
+            record_info['whats_raw'] = whats_raw
+            record_info['whats_formatted'] = whats_formatted
+
             # Download boletos
             downloaded_files = await self.download_boletos_enhanced(page, grupo, cota, record_info, timing_config)
             
@@ -599,24 +1134,16 @@ class EnhancedProductionProcessor:
                            batch_size: int = 1, timing_config: Dict = None) -> None:
         """Run the enhanced automation process."""
         
-        # Load Excel data
-        try:
-            df = pd.read_excel(excel_file)
-            self.logger.info(f"📊 Loaded {len(df)} records from {excel_file}")
-        except Exception as e:
-            self.logger.error(f"❌ Error loading Excel file: {e}")
+        records = self.load_records(excel_file, start_from, max_records)
+        if not records:
+            self.logger.error("No records available to process. Aborting run.")
             return
-        
-        # Apply filters
+
         if start_from > 1:
-            df = df.iloc[start_from-1:]
             self.logger.info(f"📍 Starting from record {start_from}")
-        
         if max_records:
-            df = df.head(max_records)
             self.logger.info(f"📊 Limited to {max_records} records")
-        
-        records = df.to_dict('records')
+
         self.logger.info(f"🎯 Processing {len(records)} records")
         self.logger.info("🚀 ENHANCED PRODUCTION VERSION: Direct POST with table population")
         

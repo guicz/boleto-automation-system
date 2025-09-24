@@ -39,6 +39,27 @@ python test_final_solution.py
 ./run_final_solution.sh --batch-size 5
 ```
 
+### 5. Signed PDF delivery (WhatsApp)
+
+1. Configure `file_server` in `config.yaml` with your public base URL and a strong `secret_key`.
+2. Expose the `downloads/` directory with the signed link server:
+   ```bash
+   python file_link_service.py downloads "<secret_key>" --host 0.0.0.0 --port 8080
+   ```
+   (Run behind your preferred HTTP server/reverse proxy.)
+3. Update the n8n webhook to expect the JSON payload fields `phone`, `message`, `file_url`, `file_name`, and `drive_file_id`.
+4. In n8n, download `file_url`, upload the PDF via WhatsApp Cloud `/media`, then send the document message with the returned `media_id`.
+   ```json
+   {
+     "phone": "+5511999999999",
+     "file_url": "https://your-domain.com/files?path=...",
+     "file_name": "CLIENTE-123-456.pdf",
+     "message": "Olá ...",
+     "drive_file_id": "1AbCdEf..."
+   }
+   ```
+5. Keep the webhook URL em “modo produção” (não `.../webhook-test/...`) para evitar expiração após cada execução.
+
 ## 📁 Files Included
 
 ### Core Scripts
