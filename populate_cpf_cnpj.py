@@ -7,8 +7,10 @@ import argparse
 import asyncio
 import logging
 import re
+from pathlib import Path
 from typing import List, Optional, Tuple
 
+import pandas as pd
 from playwright.async_api import async_playwright
 
 from final_working_boleto_processor import FinalWorkingProcessor
@@ -58,25 +60,42 @@ class CPFPopulator:
     def __init__(
         self,
         config_path: str,
-        sheet_range: str,
         header_title: str,
         force: bool,
         delay: float,
+        sheet_range: Optional[str] = None,
+        csv_path: Optional[str] = None,
+        csv_encoding: str = "utf-8",
+        csv_delimiter: str = ",",
     ) -> None:
+        if not sheet_range and not csv_path:
+            raise ValueError("Either sheet_range or csv_path must be provided")
+        if sheet_range and csv_path:
+            raise ValueError("Provide only one of sheet_range or csv_path")
+
         self.processor = FinalWorkingProcessor(config_path)
-        self.sheet_name, self.data_range = parse_sheet_range(sheet_range)
         self.header_title = header_title
         self.normalized_header = normalize_header(header_title)
         self.force = force
         self.delay = delay
 
-        if not self.processor.google_sheets_client:
-            raise RuntimeError("Google Sheets ingestion is not enabled in config.yaml")
-        self.sheets = self.processor.google_sheets_client
+        self.sheet_range = sheet_range
+        self.csv_path = Path(csv_path).resolve() if csv_path else None
+        self.csv_encoding = csv_encoding
+        self.csv_delimiter = csv_delimiter
 
+        self.sheets = None
+        self.sheet_name: Optional[str] = None
+        self.data_range: Optional[str] = None
         self.grupo_index: Optional[int] = None
         self.cota_index: Optional[int] = None
         self.cpf_index: Optional[int] = None
+
+        if self.sheet_range:
+            if not self.processor.google_sheets_client:
+                raise RuntimeError("Google Sheets ingestion is not enabled in config.yaml")
+            self.sheets = self.processor.google_sheets_client
+            self.sheet_name, self.data_range = parse_sheet_range(self.sheet_range)
 
     def _ensure_header(self) -> List[str]:
         header_values = self.sheets.get_values(format_range(self.sheet_name, "1:1"))
@@ -115,6 +134,12 @@ class CPFPopulator:
         return rows
 
     async def populate(self) -> None:
+        if self.csv_path:
+            await self._populate_csv()
+        else:
+            await self._populate_sheet()
+
+    async def _populate_sheet(self) -> None:
         header_row = self._ensure_header()
         rows = self._load_rows(header_row)
         if not rows:
@@ -247,9 +272,150 @@ class CPFPopulator:
             filled,
         )
 
+    async def _populate_csv(self) -> None:
+        if not self.csv_path:
+            raise RuntimeError("CSV path not configured")
+
+        if not self.csv_path.exists():
+            raise FileNotFoundError(f"CSV file not found: {self.csv_path}")
+
+        df = pd.read_csv(
+            self.csv_path,
+            sep=self.csv_delimiter,
+            encoding=self.csv_encoding,
+            dtype=str,
+        ).fillna("")
+
+        headers = list(df.columns)
+        if "GRUPO" not in headers or "COTA" not in headers:
+            raise RuntimeError("CSV must contain GRUPO and COTA columns")
+
+        if self.header_title not in headers:
+            df[self.header_title] = ""
+            headers.append(self.header_title)
+            LOGGER.info("Added new column '%s' to CSV", self.header_title)
+
+        processed = 0
+        skipped_existing = 0
+        filled = 0
+
+        browser_config = self.processor.config.get("browser", {})
+        headless = browser_config.get("headless", True)
+        slow_mo = browser_config.get("slow_mo")
+        viewport = browser_config.get("viewport", {"width": 1280, "height": 720})
+
+        browser_args = [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-gpu",
+            "--disable-web-security",
+            "--disable-background-timer-throttling",
+            "--disable-renderer-backgrounding",
+            "--disable-popup-blocking",
+            "--print-to-pdf-no-header",
+            "--run-all-compositor-stages-before-draw",
+        ]
+
+        async with async_playwright() as p:
+            launch_kwargs = {"headless": headless, "args": browser_args}
+            if slow_mo is not None:
+                launch_kwargs["slow_mo"] = slow_mo
+
+            browser = await p.chromium.launch(**launch_kwargs)
+
+            context_kwargs = {"accept_downloads": False}
+            if viewport:
+                context_kwargs["viewport"] = viewport
+
+            context = await browser.new_context(**context_kwargs)
+            page = await context.new_page()
+
+            try:
+                login_success = await self.processor.login(page)
+                if not login_success:
+                    raise RuntimeError("Login failed; cannot continue CPF population")
+
+                updated_values: List[str] = []
+                for idx, row in df.iterrows():
+                    grupo_raw = row.get("GRUPO", "")
+                    cota_raw = row.get("COTA", "")
+                    existing_doc = str(row.get(self.header_title, "")).strip()
+
+                    grupo = self.processor.sanitize_grupo(grupo_raw)
+                    cota = self.processor.sanitize_cota(cota_raw)
+
+                    if not grupo or not cota:
+                        LOGGER.warning(
+                            "Skipping CSV row %s due to missing grupo/cota (raw: %s / %s)",
+                            idx + 2,
+                            grupo_raw,
+                            cota_raw,
+                        )
+                        updated_values.append(existing_doc)
+                        continue
+
+                    if existing_doc and not self.force:
+                        skipped_existing += 1
+                        updated_values.append(existing_doc)
+                        continue
+
+                    processed += 1
+                    success, search_result = await self.processor.search_record(page, grupo, cota)
+                    cpf_cnpj = existing_doc
+                    if success:
+                        cpf_cnpj = search_result.get("cpf_cnpj") or existing_doc
+                        status = search_result.get("contemplado_status", "")
+                        LOGGER.info(
+                            "CSV row %s (%s/%s) → CPF=%s Status=%s",
+                            idx + 2,
+                            grupo,
+                            cota,
+                            cpf_cnpj or "",
+                            status,
+                        )
+                        if cpf_cnpj and not existing_doc:
+                            filled += 1
+                    else:
+                        LOGGER.error(
+                            "Unable to fetch CPF for %s/%s (CSV row %s): %s",
+                            grupo,
+                            cota,
+                            idx + 2,
+                            search_result.get("error"),
+                        )
+
+                    updated_values.append((cpf_cnpj or "").strip())
+                    if self.delay:
+                        await asyncio.sleep(self.delay)
+
+            finally:
+                await context.close()
+                await browser.close()
+
+        if len(updated_values) != len(df):
+            raise RuntimeError("Mismatch between CSV rows and collected values")
+
+        df[self.header_title] = updated_values
+        df.to_csv(
+            self.csv_path,
+            sep=self.csv_delimiter,
+            encoding=self.csv_encoding,
+            index=False,
+        )
+
+        LOGGER.info(
+            "CSV population completed: %s rows processed, %s existing skipped, %s new values written",
+            processed,
+            skipped_existing,
+            filled,
+        )
+
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Populate Google Sheets with CPF/CNPJ data.")
+    parser = argparse.ArgumentParser(
+        description="Populate CPF/CNPJ data into Google Sheets or a local CSV."
+    )
     parser.add_argument(
         "--config",
         default="config.yaml",
@@ -257,8 +423,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--sheet-range",
-        default="Página1!A:D",
-        help="Sheet range containing GRUPO/COTA columns (default: Página1!A:D)",
+        help="Sheet range (e.g. 'Página1!A:D') to update in Google Sheets",
+    )
+    parser.add_argument(
+        "--csv-path",
+        help="Local CSV file to update (mutually exclusive with --sheet-range)",
+    )
+    parser.add_argument(
+        "--csv-delimiter",
+        default=",",
+        help="Delimiter used in the CSV (default: ',')",
+    )
+    parser.add_argument(
+        "--csv-encoding",
+        default="utf-8",
+        help="CSV encoding (default: utf-8)",
     )
     parser.add_argument(
         "--header-title",
@@ -290,12 +469,19 @@ async def run_async(args: argparse.Namespace) -> None:
         level=getattr(logging, args.log_level.upper()),
         format="%(asctime)s - %(levelname)s - %(message)s",
     )
+    sheet_range = args.sheet_range
+    csv_path = args.csv_path
+    if not sheet_range and not csv_path:
+        sheet_range = "Página1!A:D"
     populator = CPFPopulator(
         config_path=args.config,
-        sheet_range=args.sheet_range,
         header_title=args.header_title,
         force=args.force,
         delay=args.delay,
+        sheet_range=sheet_range,
+        csv_path=csv_path,
+        csv_encoding=args.csv_encoding,
+        csv_delimiter=args.csv_delimiter,
     )
     await populator.populate()
 

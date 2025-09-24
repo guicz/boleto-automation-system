@@ -136,20 +136,27 @@ Timing (usually not needed):
 ```
 
 ### Populate CPF/CNPJ Cache
-Before large runs, you can pre-fill the Google Sheet with CPF/CNPJ for every grupo/cota. This lets the automation jump straight to the boleto screen without repeating the lookup each day.
+Você pode adiantar a base de CPFs/CNPJs antes das execuções, tanto na planilha do Google quanto no CSV local.
 
 ```bash
+# Atualizar a planilha (usa a conta de serviço do config.yaml)
 python populate_cpf_cnpj.py \
   --sheet-range "Página1!A:D" \
-  --header-title "CPF/CNPJ"
+  --header-title "DOCUMENTO" \
+  --delay 0.5
+
+# Atualizar o arquivo local tabela.csv
+python populate_cpf_cnpj.py \
+  --csv-path tabela.csv \
+  --header-title "DOCUMENTO" \
+  --delay 0.5
 ```
 
-- Uses the same config/service account from `config.yaml`.
-- Adds the `CPF/CNPJ` header if it does not exist and fills the column.
-- Skips rows that already have a value; use `--force` to refresh everything.
-- Optional `--delay 0.5` to be gentle with the HS Consórcios portal.
+- A coluna indicada em `--header-title` é criada caso ainda não exista.
+- Linhas que já possuem valor são preservadas; use `--force` para sobrescrever tudo.
+- `--delay` opcional ajuda a espaçar as requisições ao portal HS Consórcios.
 
-Once populated, the monthly update run only needs to process new contracts.
+Com a base preenchida, as execuções diárias evitam refazer a consulta de documento para cada cota.
 
 ## 📊 Expected Performance
 
