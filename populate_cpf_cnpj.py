@@ -67,6 +67,7 @@ class CPFPopulator:
         csv_path: Optional[str] = None,
         csv_encoding: str = "utf-8",
         csv_delimiter: str = ",",
+        flush_every: int = 1,
     ) -> None:
         if not sheet_range and not csv_path:
             raise ValueError("Either sheet_range or csv_path must be provided")
@@ -83,6 +84,7 @@ class CPFPopulator:
         self.csv_path = Path(csv_path).resolve() if csv_path else None
         self.csv_encoding = csv_encoding
         self.csv_delimiter = csv_delimiter
+        self.flush_every = max(1, flush_every)
 
         self.sheets = None
         self.sheet_name: Optional[str] = None
@@ -142,18 +144,17 @@ class CPFPopulator:
     async def _populate_sheet(self) -> None:
         header_row = self._ensure_header()
         rows = self._load_rows(header_row)
+        if self.grupo_index is None or self.cota_index is None or self.cpf_index is None:
+            raise RuntimeError("Header indices were not initialized correctly")
+
         if not rows:
             LOGGER.warning("No data rows found to process")
             return
 
-        if self.grupo_index is None or self.cota_index is None or self.cpf_index is None:
-            raise RuntimeError("Header indices were not initialized correctly")
-
-        column_values: List[str] = []
-        total_rows = len(rows)
         processed = 0
         skipped_existing = 0
         filled = 0
+        pending_updates: List[Tuple[int, str]] = []
 
         browser_config = self.processor.config.get("browser", {})
         headless = browser_config.get("headless", True)
@@ -202,7 +203,6 @@ class CPFPopulator:
                     cota = self.processor.sanitize_cota(cota_raw)
 
                     if not grupo or not cota:
-                        column_values.append(existing_cpf)
                         LOGGER.warning(
                             "Skipping row %s due to missing grupo/cota (raw values: %s / %s)",
                             idx,
@@ -212,7 +212,6 @@ class CPFPopulator:
                         continue
 
                     if existing_cpf and not self.force:
-                        column_values.append(existing_cpf)
                         skipped_existing += 1
                         continue
 
@@ -241,7 +240,17 @@ class CPFPopulator:
                             search_result.get("error"),
                         )
 
-                    column_values.append((cpf_cnpj or "").strip())
+                    new_value = (cpf_cnpj or "").strip()
+                    if new_value and new_value != existing_cpf:
+                        pending_updates.append((idx, new_value))
+                        if len(pending_updates) >= self.flush_every:
+                            self._flush_sheet_updates(pending_updates)
+                            pending_updates.clear()
+                    elif self.force:
+                        pending_updates.append((idx, new_value))
+                        if len(pending_updates) >= self.flush_every:
+                            self._flush_sheet_updates(pending_updates)
+                            pending_updates.clear()
                     if self.delay:
                         await asyncio.sleep(self.delay)
 
@@ -249,21 +258,11 @@ class CPFPopulator:
                 await context.close()
                 await browser.close()
 
-        if len(column_values) != total_rows:
-            raise RuntimeError(
-                "Mismatch between processed rows and collected values: %s vs %s"
-                % (len(column_values), total_rows)
-            )
+        if pending_updates:
+            self._flush_sheet_updates(pending_updates)
 
-        target_column_letter = column_index_to_letter(self.cpf_index + 1)
-        target_range = format_range(
-            self.sheet_name,
-            f"{target_column_letter}2:{target_column_letter}{total_rows + 1}",
-        )
-        values_payload = [[value] for value in column_values]
-        update_success = self.sheets.update_values(target_range, values_payload)
-        if not update_success:
-            raise RuntimeError("Failed to update CPF column in Google Sheets")
+        if processed == 0 and skipped_existing == 0:
+            LOGGER.info("No updates were necessary for the selected sheet range")
 
         LOGGER.info(
             "CPF population completed: %s rows processed, %s existing skipped, %s new values written",
@@ -271,6 +270,19 @@ class CPFPopulator:
             skipped_existing,
             filled,
         )
+
+    def _flush_sheet_updates(self, updates: List[Tuple[int, str]]) -> None:
+        if not updates:
+            return
+        if not self.sheets:
+            raise RuntimeError("Sheets client not configured")
+        target_column_letter = column_index_to_letter(self.cpf_index + 1)
+        for row_index, value in updates:
+            target = format_range(self.sheet_name, f"{target_column_letter}{row_index}")
+            success = self.sheets.update_values(target, [[value]])
+            if not success:
+                raise RuntimeError(f"Failed to update cell {target}")
+        LOGGER.debug("Flushed %s sheet updates", len(updates))
 
     async def _populate_csv(self) -> None:
         if not self.csv_path:
@@ -298,6 +310,7 @@ class CPFPopulator:
         processed = 0
         skipped_existing = 0
         filled = 0
+        pending_dirty = 0
 
         browser_config = self.processor.config.get("browser", {})
         headless = browser_config.get("headless", True)
@@ -336,7 +349,6 @@ class CPFPopulator:
                 if not login_success:
                     raise RuntimeError("Login failed; cannot continue CPF population")
 
-                updated_values: List[str] = []
                 for idx, row in df.iterrows():
                     grupo_raw = row.get("GRUPO", "")
                     cota_raw = row.get("COTA", "")
@@ -352,12 +364,10 @@ class CPFPopulator:
                             grupo_raw,
                             cota_raw,
                         )
-                        updated_values.append(existing_doc)
                         continue
 
                     if existing_doc and not self.force:
                         skipped_existing += 1
-                        updated_values.append(existing_doc)
                         continue
 
                     processed += 1
@@ -385,7 +395,15 @@ class CPFPopulator:
                             search_result.get("error"),
                         )
 
-                    updated_values.append((cpf_cnpj or "").strip())
+                    new_value = (cpf_cnpj or "").strip()
+                    if new_value != existing_doc or (self.force and new_value):
+                        df.at[idx, self.header_title] = new_value
+                        pending_dirty += 1
+                        if new_value and not existing_doc:
+                            filled += 1
+                    if pending_dirty >= self.flush_every:
+                        self._flush_csv(df)
+                        pending_dirty = 0
                     if self.delay:
                         await asyncio.sleep(self.delay)
 
@@ -393,16 +411,8 @@ class CPFPopulator:
                 await context.close()
                 await browser.close()
 
-        if len(updated_values) != len(df):
-            raise RuntimeError("Mismatch between CSV rows and collected values")
-
-        df[self.header_title] = updated_values
-        df.to_csv(
-            self.csv_path,
-            sep=self.csv_delimiter,
-            encoding=self.csv_encoding,
-            index=False,
-        )
+        if pending_dirty:
+            self._flush_csv(df)
 
         LOGGER.info(
             "CSV population completed: %s rows processed, %s existing skipped, %s new values written",
@@ -410,6 +420,17 @@ class CPFPopulator:
             skipped_existing,
             filled,
         )
+
+    def _flush_csv(self, df: pd.DataFrame) -> None:
+        if not self.csv_path:
+            return
+        df.to_csv(
+            self.csv_path,
+            sep=self.csv_delimiter,
+            encoding=self.csv_encoding,
+            index=False,
+        )
+        LOGGER.debug("CSV file flushed to disk (%s)", self.csv_path)
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -438,6 +459,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--csv-encoding",
         default="utf-8",
         help="CSV encoding (default: utf-8)",
+    )
+    parser.add_argument(
+        "--flush-every",
+        type=int,
+        default=1,
+        help="Persist changes every N updates (default: 1)",
     )
     parser.add_argument(
         "--header-title",
@@ -482,6 +509,7 @@ async def run_async(args: argparse.Namespace) -> None:
         csv_path=csv_path,
         csv_encoding=args.csv_encoding,
         csv_delimiter=args.csv_delimiter,
+        flush_every=args.flush_every,
     )
     await populator.populate()
 

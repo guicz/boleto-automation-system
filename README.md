@@ -143,17 +143,20 @@ Você pode adiantar a base de CPFs/CNPJs antes das execuções, tanto na planilh
 python populate_cpf_cnpj.py \
   --sheet-range "Página1!A:D" \
   --header-title "DOCUMENTO" \
-  --delay 0.5
+  --delay 0.5 \
+  --flush-every 1
 
 # Atualizar o arquivo local tabela.csv
 python populate_cpf_cnpj.py \
   --csv-path tabela.csv \
   --header-title "DOCUMENTO" \
-  --delay 0.5
+  --delay 0.5 \
+  --flush-every 1
 ```
 
 - A coluna indicada em `--header-title` é criada caso ainda não exista.
 - Linhas que já possuem valor são preservadas; use `--force` para sobrescrever tudo.
+- `--flush-every` controla de quantos em quantos registros os dados são persistidos (1 = salva a cada atualização).
 - `--delay` opcional ajuda a espaçar as requisições ao portal HS Consórcios.
 
 Com a base preenchida, as execuções diárias evitam refazer a consulta de documento para cada cota.
