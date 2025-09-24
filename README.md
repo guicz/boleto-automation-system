@@ -161,6 +161,48 @@ python populate_cpf_cnpj.py \
 
 Com a base preenchida, as execuções diárias evitam refazer a consulta de documento para cada cota.
 
+## 📚 Visão Geral das Implementações
+
+- **Upload automático para o Google Drive** – PDFs são enviados para o drive compartilhado `0AAcUWkdO1T0zUk9PVA` criando pastas `ano/mês`. Todas as credenciais ficam em `config.yaml`.
+- **Links assinados para entrega** – `file_link_service.py` gera URLs temporárias usando `secret_key`; o domínio `https://faturas.suzanarighihs.com.br/files` aponta para o servidor local na porta 18181.
+- **Integração com webhook (n8n/WhatsApp)** – quando `notifications.enabled` for `true`, `notifier.py` dispara o JSON com `phone`, `message`, `file_url` e `drive_file_id` para o fluxo n8n.
+- **Leitura resiliente de dados** – suporte a CSV (`tabela.csv`), Google Sheets (`Página1!A:D`) e cache de registros processados (`logs/processed_records.json`) evitando downloads repetidos.
+- **Preenchimento incremental de CPF/CNPJ** – `populate_cpf_cnpj.py` aceita planilha ou CSV, grava cada célula/linha conforme atualiza (`--flush-every`), e suporta `--force` para sobrescrever valores.
+- **Log de resultados** – os relatórios ficam em `reports/`, o dashboard da planilha recebe os status e o arquivo `complete_fixed_automation.log` traz o passo a passo com detalhes de cada cota.
+
+## 🔄 Fluxo Recomendado
+
+1. **Atualizar CPFs/CNPJs (opcional, mas recomendado)**
+   ```bash
+   python populate_cpf_cnpj.py \
+     --sheet-range 'Página1!A:D' \
+     --header-title 'DOCUMENTO' \
+     --delay 0.5 \
+     --flush-every 1 \
+     --log-level INFO
+   ```
+   - Gera a coluna caso necessário e preenche célula a célula; use `--force` para reprocessar.
+   - Para manter um espelho local, troque por `--csv-path tabela.csv`.
+
+2. **Rodar a automação principal**
+   ```bash
+   ./run_final_solution.sh --batch-size 100
+   ```
+   - Baixa os PDFs, envia ao Drive e gera os links assinados.
+
+3. **Verificar saídas**
+   - **Drive**: hierarquia `ano/mês`.
+   - **Planilha Dashboard**: status de download/Drive/notificação.
+   - **Logs**: `logs/enhanced_automation_*.log` e `complete_fixed_automation.log`.
+
+## ⚙️ Configurações Principais
+
+- `config.yaml` – credenciais, parâmetros do portal, Google Drive, webhook e servidor de arquivos.
+- `google_drive.credentials_path` – arquivo da service account (`suzana-playwright-e1656f768d86.json`).
+- `file_server.secret_key` – gere com `openssl rand -base64 48` e mantenha em segurança.
+- `notifications` – habilite quando o fluxo n8n estiver em produção.
+- `processing.skip_processed_records` – controla o cache de cotas já processadas.
+
 ## 📊 Expected Performance
 
 ### Success Metrics
