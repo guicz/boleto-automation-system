@@ -14,6 +14,7 @@ import pandas as pd
 from playwright.async_api import async_playwright
 
 from final_working_boleto_processor import FinalWorkingProcessor
+from google_sheets_client import GoogleSheetsClient
 
 
 LOGGER = logging.getLogger("cpf_populator")
@@ -94,9 +95,24 @@ class CPFPopulator:
         self.cpf_index: Optional[int] = None
 
         if self.sheet_range:
-            if not self.processor.google_sheets_client:
-                raise RuntimeError("Google Sheets ingestion is not enabled in config.yaml")
-            self.sheets = self.processor.google_sheets_client
+            credentials_path_cfg = self.processor.config.get('google_drive', {}).get('credentials_path')
+            if not credentials_path_cfg:
+                raise RuntimeError("Google Sheets population requires google_drive.credentials_path in config.yaml")
+
+            credentials_path = Path(credentials_path_cfg)
+            if not credentials_path.is_absolute():
+                credentials_path = self.processor.config_path.parent / credentials_path
+
+            spreadsheet_id = self.processor.config.get('data_source', {}).get('google_sheets', {}).get('spreadsheet_id')
+            if not spreadsheet_id:
+                raise RuntimeError("Google Sheets spreadsheet_id not configured in config.yaml")
+
+            self.sheets = GoogleSheetsClient(
+                credentials_path=credentials_path,
+                spreadsheet_id=spreadsheet_id,
+                logger=self.processor.logger,
+                scopes=GoogleSheetsClient.READ_WRITE_SCOPES,
+            )
             self.sheet_name, self.data_range = parse_sheet_range(self.sheet_range)
 
     def _ensure_header(self) -> List[str]:
