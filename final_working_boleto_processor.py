@@ -559,13 +559,32 @@ class FinalWorkingProcessor:
         return None
 
     def sanitize_grupo(self, raw_value: str) -> str:
-        return re.sub(r'\D', '', raw_value or '')
+        if raw_value is None:
+            cleaned = ''
+        elif isinstance(raw_value, float):
+            if math.isnan(raw_value):
+                cleaned = ''
+            else:
+                cleaned = str(int(raw_value)) if raw_value.is_integer() else str(raw_value)
+        else:
+            cleaned = str(raw_value)
+        return re.sub(r'\D', '', cleaned)
 
     def sanitize_cota(self, raw_value: str) -> str:
-        value = (raw_value or '').split('-')[0]
-        digits = re.sub(r'\D', '', value)
+        if raw_value is None:
+            raw = ''
+        elif isinstance(raw_value, float):
+            if math.isnan(raw_value):
+                raw = ''
+            else:
+                raw = str(int(raw_value)) if raw_value.is_integer() else str(raw_value)
+        else:
+            raw = str(raw_value)
+
+        primary_segment = raw.split('-')[0]
+        digits = re.sub(r'\D', '', primary_segment)
         if not digits:
-            digits = re.sub(r'\D', '', raw_value or '')
+            digits = re.sub(r'\D', '', raw)
         return digits
 
     def load_records(
@@ -1144,8 +1163,8 @@ class FinalWorkingProcessor:
                 links_to_process = pgto_parc_links[:1]
                 self.logger.info("CONTEMPLADO - downloading most recent boleto only")
             else:
-                links_to_process = pgto_parc_links
-                self.logger.info(f"NÃO CONTEMPLADO - downloading all {len(links_to_process)} boletos")
+                links_to_process = pgto_parc_links[:1]
+                self.logger.info("NÃO CONTEMPLADO - downloading most recent boleto only")
             
             # Process each PGTO PARC link with direct POST method
             for i, link in enumerate(links_to_process):
@@ -1554,12 +1573,14 @@ class FinalWorkingProcessor:
                         grupo_key = str(result.get('grupo', '')).strip()
                         cota_key = str(result.get('cota', '')).strip()
 
-                        if self.processed_tracker and result.get('status') == 'success':
+                        status = result.get('status')
+                        if self.processed_tracker and status in ('success', 'no_downloads'):
                             drive_ids = result.get('drive_file_ids')
                             metadata = {
                                 'timestamp': result.get('timestamp'),
-                                'downloaded_files': result.get('downloaded_files', []),
+                                'downloaded_files': result.get('downloaded_files', []) if status == 'success' else [],
                                 'cpf_cnpj': result.get('cpf_cnpj'),
+                                'status': status,
                             }
                             if drive_ids:
                                 metadata['drive_file_ids'] = drive_ids
@@ -1570,16 +1591,16 @@ class FinalWorkingProcessor:
                             )
 
                         if self.resume_manager and self.resume_enabled and grupo_key and cota_key:
-                            if result.get('status') == 'login_failed':
+                            if status == 'login_failed':
                                 self.resume_manager.mark_pending(grupo_key, cota_key)
                             else:
                                 self.resume_manager.mark_completed(grupo_key, cota_key)
 
-                        if result.get('status') == 'login_failed':
+                        if status == 'login_failed':
                             consecutive_login_failures += 1
                             if consecutive_login_failures >= self.max_login_failures_checkpoint:
                                 self.logger.error(
-                                    "Exceeded %s consecutive login failures; checkpoint reached. Stopping run for later retry.",
+                                    'Exceeded %s consecutive login failures; checkpoint reached. Stopping run for later retry.',
                                     self.max_login_failures_checkpoint,
                                 )
                                 return

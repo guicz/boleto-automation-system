@@ -169,6 +169,7 @@ Com a base preenchida, as execuções diárias evitam refazer a consulta de docu
 - **Leitura resiliente de dados** – suporte a CSV (`tabela.csv`), Google Sheets (`Página1!A:D`) e cache de registros processados (`logs/processed_records.json`) evitando downloads repetidos.
 - **Checkpoints automáticos** – `logs/resume_state.json` registra a última cota concluída ou pendente; ao reiniciar, o processamento retoma deste ponto (ou use `--ignore-resume` para começar do zero).
 - **Preenchimento incremental de CPF/CNPJ** – `populate_cpf_cnpj.py` aceita planilha ou CSV, grava cada célula/linha conforme atualiza (`--flush-every`), e suporta `--force` para sobrescrever valores.
+- **Somente boleto atual** – mesmo para cotas não contempladas, baixamos apenas o boleto mais recente (evita duplicados `_0`, `_1` no Drive).
 - **Log de resultados** – os relatórios ficam em `reports/`, o dashboard da planilha recebe os status e o arquivo `complete_fixed_automation.log` traz o passo a passo com detalhes de cada cota.
 
 ## 🔄 Fluxo Recomendado
