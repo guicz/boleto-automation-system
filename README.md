@@ -167,6 +167,7 @@ Com a base preenchida, as execuções diárias evitam refazer a consulta de docu
 - **Links assinados para entrega** – `file_link_service.py` gera URLs temporárias usando `secret_key`; o domínio `https://faturas.suzanarighihs.com.br/files` aponta para o servidor local na porta 18181.
 - **Integração com webhook (n8n/WhatsApp)** – quando `notifications.enabled` for `true`, `notifier.py` dispara o JSON com `phone`, `message`, `file_url` e `drive_file_id` para o fluxo n8n.
 - **Leitura resiliente de dados** – suporte a CSV (`tabela.csv`), Google Sheets (`Página1!A:D`) e cache de registros processados (`logs/processed_records.json`) evitando downloads repetidos.
+- **Checkpoints automáticos** – `logs/resume_state.json` registra a última cota concluída ou pendente; ao reiniciar, o processamento retoma deste ponto (ou use `--ignore-resume` para começar do zero).
 - **Preenchimento incremental de CPF/CNPJ** – `populate_cpf_cnpj.py` aceita planilha ou CSV, grava cada célula/linha conforme atualiza (`--flush-every`), e suporta `--force` para sobrescrever valores.
 - **Log de resultados** – os relatórios ficam em `reports/`, o dashboard da planilha recebe os status e o arquivo `complete_fixed_automation.log` traz o passo a passo com detalhes de cada cota.
 
@@ -201,7 +202,7 @@ Com a base preenchida, as execuções diárias evitam refazer a consulta de docu
 - `google_drive.credentials_path` – arquivo da service account (`suzana-playwright-e1656f768d86.json`).
 - `file_server.secret_key` – gere com `openssl rand -base64 48` e mantenha em segurança.
 - `notifications` – habilite quando o fluxo n8n estiver em produção.
-- `processing.skip_processed_records` – controla o cache de cotas já processadas.
+- `processing.skip_processed_records` / `resume_state_file` – evitam retrabalho e guardam checkpoints; remova o arquivo `logs/resume_state.json` ou use `--ignore-resume` para um run do zero.
 
 ## 📊 Expected Performance
 

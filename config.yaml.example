@@ -35,6 +35,9 @@ processing:
   skip_processed_records: true
   processed_state_file: "logs/processed_records.json"
   processed_retention_days: 365
+  resume_enabled: true
+  resume_state_file: "logs/resume_state.json"
+  login_failure_checkpoint: 3
 
 browser:
   headless: false

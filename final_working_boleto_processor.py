@@ -135,6 +135,73 @@ class ProcessedRecordTracker:
         self._save()
 
 
+
+class ResumeManager:
+    """Handles persistence of resume checkpoints for interrupted runs."""
+
+    def __init__(self, path: Optional[Path], enabled: bool, logger: logging.Logger) -> None:
+        self.path = path
+        self.enabled = enabled and path is not None
+        self.logger = logger
+
+    def load_state(self) -> Dict[str, Dict[str, str]]:
+        if not self.enabled or not self.path or not self.path.exists():
+            return {}
+        try:
+            with open(self.path, 'r', encoding='utf-8') as handle:
+                data = json.load(handle)
+            if isinstance(data, dict):
+                return data
+            self.logger.warning("Resume state file %s is invalid; ignoring", self.path)
+        except Exception as error:
+            self.logger.error("Failed to load resume state %s: %s", self.path, error)
+        return {}
+
+    def mark_completed(self, grupo: str, cota: str) -> None:
+        if not self.enabled:
+            return
+        state = self.load_state()
+        state['last_processed'] = {'grupo': grupo, 'cota': cota}
+        pending = state.get('pending')
+        if pending and (
+            str(pending.get('grupo', '')) == grupo
+            and str(pending.get('cota', '')) == cota
+        ):
+            state.pop('pending', None)
+        state['timestamp'] = datetime.now().isoformat()
+        self._write_state(state)
+
+    def mark_pending(self, grupo: str, cota: str) -> None:
+        if not self.enabled:
+            return
+        state = self.load_state()
+        state['pending'] = {'grupo': grupo, 'cota': cota}
+        state['timestamp'] = datetime.now().isoformat()
+        self._write_state(state)
+
+    def clear(self) -> None:
+        if not self.enabled or not self.path:
+            return
+        try:
+            if self.path.exists():
+                self.path.unlink()
+                self.logger.debug("Cleared resume state file %s", self.path)
+        except Exception as error:
+            self.logger.error("Failed to clear resume state %s: %s", self.path, error)
+
+    def _write_state(self, state: Dict) -> None:
+        if not self.enabled or not self.path:
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = self.path.with_suffix(self.path.suffix + '.tmp')
+            with open(tmp_path, 'w', encoding='utf-8') as handle:
+                json.dump(state, handle, indent=2, ensure_ascii=False)
+            tmp_path.replace(self.path)
+        except Exception as error:
+            self.logger.error("Failed to persist resume state %s: %s", self.path, error)
+
+
 class FinalWorkingProcessor:
     def __init__(self, config_path: str = "config.yaml"):
         """Initialize the final working processor."""
@@ -153,12 +220,16 @@ class FinalWorkingProcessor:
         self.notifier: Optional[WebhookNotifier] = None
         self.processed_tracker: Optional[ProcessedRecordTracker] = None
         self.skip_processed_records = False
+        self.resume_manager: Optional[ResumeManager] = None
+        self.resume_enabled = False
+        self.max_login_failures_checkpoint = 5
         self.setup_google_drive()
         self.setup_google_sheets()
         self.setup_google_sheets_logger()
         self.setup_file_server()
         self.setup_notifier()
         self.setup_processed_tracker()
+        self.setup_resume_manager()
         
     def load_config(self, config_path: Path) -> Dict:
         """Load configuration from YAML file."""
@@ -406,6 +477,23 @@ class FinalWorkingProcessor:
             self.logger.error("Failed to initialise processed record tracker: %s", error)
             self.processed_tracker = None
             self.skip_processed_records = False
+
+    def setup_resume_manager(self) -> None:
+        processing_config = self.config.get('processing', {}) or {}
+        resume_enabled = processing_config.get('resume_enabled', True)
+        resume_file_cfg = processing_config.get('resume_state_file')
+        self.max_login_failures_checkpoint = int(processing_config.get('login_failure_checkpoint', 5))
+
+        if not resume_enabled or not resume_file_cfg:
+            return
+
+        resume_path = Path(resume_file_cfg)
+        if not resume_path.is_absolute():
+            resume_path = self.config_path.parent / resume_path
+
+        self.resume_manager = ResumeManager(resume_path, True, self.logger)
+        self.resume_enabled = True
+        self.logger.info("Resume manager enabled (state file=%s)", resume_path)
 
     def parse_submit_function_args(self, onclick_attr: Optional[str]) -> Optional[List[str]]:
         if not onclick_attr:
@@ -1310,7 +1398,41 @@ class FinalWorkingProcessor:
         
         return result
     
-    async def run_automation(self, excel_file: str, start_from: int = 0, max_records: int = None, batch_size: int = 100, timing_config: Dict = None):
+    def setup_resume_manager(self) -> None:
+        processing_config = self.config.get('processing', {}) or {}
+        resume_enabled = processing_config.get('resume_enabled', True)
+        resume_file_cfg = processing_config.get('resume_state_file')
+        self.max_login_failures_checkpoint = int(processing_config.get('login_failure_checkpoint', 5))
+
+        if not resume_enabled or not resume_file_cfg:
+            return
+
+        resume_path = Path(resume_file_cfg)
+        if not resume_path.is_absolute():
+            resume_path = self.config_path.parent / resume_path
+
+        self.resume_manager = ResumeManager(resume_path, True, self.logger)
+        self.resume_enabled = True
+        self.logger.info("Resume manager enabled (state file=%s)", resume_path)
+
+
+    @staticmethod
+    def find_record_index(records: List[Dict], key: Dict[str, str]) -> Optional[int]:
+        if not key:
+            return None
+        target_grupo = str(key.get('grupo', '')).strip()
+        target_cota = str(key.get('cota', '')).strip()
+        if not target_grupo or not target_cota:
+            return None
+        for idx, record in enumerate(records):
+            if (
+                str(record.get('grupo', '')).strip() == target_grupo
+                and str(record.get('cota', '')).strip() == target_cota
+            ):
+                return idx
+        return None
+
+    async def run_automation(self, excel_file: str, start_from: int = 0, max_records: int = None, batch_size: int = 100, timing_config: Dict = None, ignore_resume: bool = False):
         """Run the final working automation."""
         if timing_config is None:
             timing_config = {
@@ -1351,6 +1473,37 @@ class FinalWorkingProcessor:
                     )
                 records = filtered_records
 
+            if self.resume_manager and self.resume_enabled and not ignore_resume and start_from == 0:
+                resume_state = self.resume_manager.load_state()
+                pending = resume_state.get('pending') if resume_state else None
+                if pending:
+                    idx = self.find_record_index(records, pending)
+                    if idx is not None:
+                        records = records[idx:]
+                        self.logger.info(
+                            "Resuming from pending record %s/%s (position %s of %s)",
+                            pending.get('grupo'),
+                            pending.get('cota'),
+                            idx + 1,
+                            len(records),
+                        )
+                    else:
+                        self.logger.warning("Pending record %s/%s not found; clearing resume state", pending.get('grupo'), pending.get('cota'))
+                        self.resume_manager.clear()
+                elif resume_state and resume_state.get('last_processed'):
+                    last_key = resume_state['last_processed']
+                    idx = self.find_record_index(records, last_key)
+                    if idx is not None:
+                        records = records[idx + 1:]
+                        self.logger.info(
+                            "Resuming after record %s/%s (skipping %s entries)",
+                            last_key.get('grupo'),
+                            last_key.get('cota'),
+                            idx + 1,
+                        )
+                    else:
+                        self.logger.info("Resume checkpoint already processed; starting with remaining records")
+
             if not records:
                 self.logger.info("No new records to process after applying processed-record filter.")
                 return
@@ -1384,6 +1537,7 @@ class FinalWorkingProcessor:
                 
                 all_results = []
                 total_downloads = 0
+                consecutive_login_failures = 0
                 
                 for i in range(0, len(records), batch_size):
                     batch = records[i:i + batch_size]
@@ -1397,10 +1551,10 @@ class FinalWorkingProcessor:
                         all_results.append(result)
                         total_downloads += result.get('downloaded_count', 0)
 
-                        if (
-                            self.processed_tracker
-                            and result.get('status') == 'success'
-                        ):
+                        grupo_key = str(result.get('grupo', '')).strip()
+                        cota_key = str(result.get('cota', '')).strip()
+
+                        if self.processed_tracker and result.get('status') == 'success':
                             drive_ids = result.get('drive_file_ids')
                             metadata = {
                                 'timestamp': result.get('timestamp'),
@@ -1410,16 +1564,33 @@ class FinalWorkingProcessor:
                             if drive_ids:
                                 metadata['drive_file_ids'] = drive_ids
                             self.processed_tracker.mark_processed(
-                                result.get('grupo', ''),
-                                result.get('cota', ''),
+                                grupo_key,
+                                cota_key,
                                 metadata,
                             )
+
+                        if self.resume_manager and self.resume_enabled and grupo_key and cota_key:
+                            if result.get('status') == 'login_failed':
+                                self.resume_manager.mark_pending(grupo_key, cota_key)
+                            else:
+                                self.resume_manager.mark_completed(grupo_key, cota_key)
+
+                        if result.get('status') == 'login_failed':
+                            consecutive_login_failures += 1
+                            if consecutive_login_failures >= self.max_login_failures_checkpoint:
+                                self.logger.error(
+                                    "Exceeded %s consecutive login failures; checkpoint reached. Stopping run for later retry.",
+                                    self.max_login_failures_checkpoint,
+                                )
+                                return
+                        else:
+                            consecutive_login_failures = 0
 
                         # Save intermediate results
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         with open(f'reports/final_working_results_{timestamp}.json', 'w', encoding='utf-8') as f:
                             json.dump(all_results, f, indent=2, ensure_ascii=False)
-                        
+
                         await asyncio.sleep(5)
                     
                     # Between batches pause
@@ -1428,6 +1599,9 @@ class FinalWorkingProcessor:
                         await asyncio.sleep(20)
                 
                 await browser.close()
+
+            if self.resume_manager and self.resume_enabled:
+                self.resume_manager.clear()
             
             # Final summary
             successful = len([r for r in all_results if r['status'] == 'success'])
@@ -1481,6 +1655,7 @@ def main():
     parser.add_argument('--max-records', type=int, default=None, help='Max records to process')
     parser.add_argument('--batch-size', type=int, default=100, help='Batch size')
     parser.add_argument('--config', default='config.yaml', help='Config file path')
+    parser.add_argument('--ignore-resume', action='store_true', help='Ignore resume checkpoints and start fresh')
     
     # Timing options
     parser.add_argument('--popup-delay', type=float, default=5.0, help='Popup delay')
@@ -1516,7 +1691,8 @@ def main():
             start_from=args.start_from,
             max_records=args.max_records,
             batch_size=args.batch_size,
-            timing_config=timing_config
+            timing_config=timing_config,
+            ignore_resume=args.ignore_resume
         ))
         
     except KeyboardInterrupt:
